@@ -8,6 +8,7 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
 const WEBAPP_URL = process.env.WEBAPP_URL;
 const PORT = Number(process.env.PORT || 3000);
+const START_BUTTON_TEXT = 'Запустить';
 
 if (!BOT_TOKEN || !ADMIN_CHAT_ID || !WEBAPP_URL) {
   throw new Error('Set BOT_TOKEN, ADMIN_CHAT_ID and WEBAPP_URL in .env');
@@ -20,6 +21,14 @@ app.use(express.json());
 
 function isTelegramDeepLink(url) {
   return /^https:\/\/t\.me\//i.test(url);
+}
+
+function buildStartMessage() {
+  return [
+    'Добро пожаловать в <b>ircom</b>!',
+    'Приложение для Цхинвала, где все важное под рукой.',
+    `Нажмите кнопку <b>«${START_BUTTON_TEXT}»</b>, чтобы перейти в приложение.`
+  ].join('\n\n');
 }
 
 function parseInitData(initData) {
@@ -88,8 +97,8 @@ async function notifyAdminAboutStart(user) {
 
 bot.start(async (ctx) => {
   const button = isTelegramDeepLink(WEBAPP_URL)
-    ? Markup.inlineKeyboard([Markup.button.url('Запустить', WEBAPP_URL)])
-    : Markup.keyboard([[Markup.button.webApp('Запустить', WEBAPP_URL)]]).resize();
+    ? Markup.inlineKeyboard([Markup.button.url(START_BUTTON_TEXT, WEBAPP_URL)])
+    : Markup.keyboard([[Markup.button.webApp(START_BUTTON_TEXT, WEBAPP_URL)]]).resize();
 
   try {
     await notifyAdminAboutStart(ctx.from);
@@ -100,8 +109,8 @@ bot.start(async (ctx) => {
     );
   }
 
-  await ctx.reply(
-    'Нажми кнопку ниже, чтобы открыть Mini App:',
+  await ctx.replyWithHTML(
+    buildStartMessage(),
     button
   );
 });
