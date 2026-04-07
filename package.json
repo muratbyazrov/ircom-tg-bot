@@ -1,15 +1,17 @@
 {
   "name": "ircom-tg-bot",
   "version": "1.0.0",
-  "description": "Telegram bot + Mini App open tracker",
+  "description": "Telegram bot + Mini App open tracker + daily digest",
   "main": "bot.js",
   "type": "commonjs",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
+    "better-sqlite3": "^11.10.0",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
+    "node-cron": "^3.0.3",
     "telegraf": "^4.16.3"
   }
 }
