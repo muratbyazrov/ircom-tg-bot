@@ -7,6 +7,9 @@ const {Telegraf, Markup} = require('telegraf');
 const {upsertSubscriber, setFrequency, getSubscriber} = require('./db.js');
 const {initScheduler} = require('./scheduler.js');
 const {runDigest, buildDigestText, getCachedStats, fetchAndCacheStats} = require('./digest.js');
+const {createLogger} = require('./logger.js');
+
+const log = createLogger('bot');
 
 const BOT_TOKEN    = process.env.BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID;
@@ -92,7 +95,7 @@ async function notifyAdmin(lines) {
     try {
         await bot.telegram.sendMessage(ADMIN_CHAT_ID, lines.join('\n'));
     } catch (err) {
-        console.error('Failed to notify admin:', err.message);
+        log.warn(`Failed to notify admin: ${err.message}`);
     }
 }
 
@@ -100,6 +103,7 @@ async function notifyAdmin(lines) {
 
 bot.start(async (ctx) => {
     const from = ctx.from || {};
+    log.info(`/start — user=${from.id} username=@${from.username || 'n/a'} name=${from.first_name || 'n/a'}`);
 
     // Регистрируем пользователя в базе подписчиков
     upsertSubscriber({
@@ -148,8 +152,11 @@ bot.action(/^freq:(.+)$/, async (ctx) => {
     const freq = ctx.match[1];
     const allowed = ['daily', 'every3days', 'only10plus', 'disabled'];
     if (!allowed.includes(freq)) {
+        log.warn(`Unknown frequency setting "${freq}" from user=${ctx.from.id}`);
         return ctx.answerCbQuery('Неизвестная настройка');
     }
+
+    log.info(`Frequency set — user=${ctx.from.id} freq=${freq}`);
 
     // Убеждаемся, что пользователь есть в базе
     upsertSubscriber({
@@ -177,6 +184,7 @@ bot.action(/^freq:(.+)$/, async (ctx) => {
 
 bot.command('preview', async (ctx) => {
     const from = ctx.from || {};
+    log.info(`/preview — user=${from.id} username=@${from.username || 'n/a'}`);
     try {
         await ctx.reply('⏳ Загружаю статистику...');
         const stats = await fetchAndCacheStats();
@@ -222,6 +230,7 @@ app.post('/webapp/open', async (req, res) => {
     try {
         const initData = req.body?.initData;
         if (!initData) {
+            log.warn('POST /webapp/open — missing initData');
             return res.status(400).json({ok: false, error: 'initData is required'});
         }
 
@@ -229,6 +238,7 @@ app.post('/webapp/open', async (req, res) => {
         const user = data.user ? JSON.parse(data.user) : null;
 
         if (user?.id) {
+            log.info(`POST /webapp/open — user=${user.id} username=@${user.username || 'n/a'}`);
             // Регистрируем пользователя при первом открытии Mini App
             upsertSubscriber({
                 telegramId: user.id,
@@ -248,6 +258,7 @@ app.post('/webapp/open', async (req, res) => {
 
         return res.json({ok: true, user_id: user?.id ?? null});
     } catch (error) {
+        log.warn(`POST /webapp/open — auth failed: ${error.message}`);
         return res.status(401).json({ok: false, error: error.message});
     }
 });
@@ -257,13 +268,17 @@ app.post('/webapp/open', async (req, res) => {
 app.post('/admin/digest/send', async (req, res) => {
     const secret = process.env.ADMIN_SECRET;
     if (secret && req.headers['x-admin-secret'] !== secret) {
+        log.warn('POST /admin/digest/send — forbidden (wrong secret)');
         return res.status(403).json({ok: false, error: 'Forbidden'});
     }
 
+    log.info('POST /admin/digest/send — manual digest triggered');
     try {
         const result = await runDigest(bot, WEBAPP_URL);
+        log.info(`POST /admin/digest/send — done: sent=${result.sent} skipped=${result.skipped} failed=${result.failed}`);
         return res.json({ok: true, ...result});
     } catch (err) {
+        log.error(`POST /admin/digest/send — error: ${err.message}`, err);
         return res.status(500).json({ok: false, error: err.message});
     }
 });
@@ -291,18 +306,19 @@ app.get('/health', (_req, res) => res.json({ok: true}));
 // ── Запуск ─────────────────────────────────────────────────────────────────────
 
 async function start() {
+    log.info(`Starting bot... PORT=${PORT} WEBAPP_URL=${WEBAPP_URL}`);
     await bot.launch();
+    log.info('Bot started polling');
     initScheduler(bot, WEBAPP_URL);
-    app.listen(PORT, () => console.log(`HTTP server: http://localhost:${PORT}`));
-    console.log('Bot started');
+    app.listen(PORT, () => log.info(`HTTP server listening on port ${PORT}`));
 }
 
-bot.catch((err) => console.error('Telegraf error:', err));
+bot.catch((err) => log.error('Telegraf error', err));
 
 start().catch((err) => {
-    console.error(err);
+    log.error('Failed to start bot', err);
     process.exit(1);
 });
 
-process.once('SIGINT',  () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT',  () => { log.info('Received SIGINT, stopping...'); bot.stop('SIGINT'); });
+process.once('SIGTERM', () => { log.info('Received SIGTERM, stopping...'); bot.stop('SIGTERM'); });

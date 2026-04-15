@@ -1,5 +1,8 @@
 const Database = require('better-sqlite3');
 const path = require('path');
+const {createLogger} = require('./logger.js');
+
+const log = createLogger('db');
 
 const DB_PATH = process.env.BOT_DB_PATH || path.join(__dirname, 'data', 'bot.db');
 
@@ -14,8 +17,10 @@ function getDb() {
         fs.mkdirSync(dir, {recursive: true});
     }
 
+    log.info(`Opening database: ${DB_PATH}`);
     _db = new Database(DB_PATH);
     _db.pragma('journal_mode = WAL');
+    log.info('Database ready (WAL mode)');
 
     _db.exec(`
         CREATE TABLE IF NOT EXISTS subscribers (
@@ -40,6 +45,7 @@ function getDb() {
 // ── Subscribers ────────────────────────────────────────────────────────────────
 
 function upsertSubscriber({telegramId, firstName, username}) {
+    log.debug(`upsertSubscriber telegramId=${telegramId} username=@${username || 'n/a'}`);
     getDb().prepare(`
         INSERT INTO subscribers (telegram_id, first_name, username)
         VALUES (@telegramId, @firstName, @username)
@@ -52,6 +58,7 @@ function upsertSubscriber({telegramId, firstName, username}) {
 function setFrequency(telegramId, frequency) {
     const allowed = ['daily', 'every3days', 'only10plus', 'disabled'];
     if (!allowed.includes(frequency)) throw new Error('Unknown frequency: ' + frequency);
+    log.info(`setFrequency telegramId=${telegramId} frequency=${frequency}`);
     getDb().prepare(
         `UPDATE subscribers SET frequency = ? WHERE telegram_id = ?`
     ).run(frequency, telegramId);

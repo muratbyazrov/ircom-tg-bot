@@ -1,6 +1,9 @@
 const https = require('https');
 const http = require('http');
 const {saveDigestCache, getDigestCache, getAllActiveSubscribers, markSent, upsertSubscriber} = require('./db.js');
+const {createLogger} = require('./logger.js');
+
+const log = createLogger('digest');
 
 const API_URL = process.env.API_URL || 'http://127.0.0.1:3002/ircom-api/v1';
 
@@ -34,6 +37,8 @@ function apiRequest(body) {
         const payload = JSON.stringify(body);
         const url = new URL(API_URL);
         const lib = url.protocol === 'https:' ? https : http;
+        const t0 = Date.now();
+        log.debug(`API request → domain=${body.domain} event=${body.event}`);
         const req = lib.request({
             hostname: url.hostname,
             port:     url.port || (url.protocol === 'https:' ? 443 : 80),
@@ -48,13 +53,18 @@ function apiRequest(body) {
             res.on('data', (chunk) => { data += chunk; });
             res.on('end', () => {
                 try {
-                    resolve(JSON.parse(data));
+                    const parsed = JSON.parse(data);
+                    log.debug(`API response ← domain=${body.domain} event=${body.event} status=${res.statusCode} in ${Date.now() - t0}ms`);
+                    resolve(parsed);
                 } catch (e) {
                     reject(new Error('Invalid JSON from API: ' + data));
                 }
             });
         });
-        req.on('error', reject);
+        req.on('error', (err) => {
+            log.error(`API request error domain=${body.domain} event=${body.event}: ${err.message}`);
+            reject(err);
+        });
         req.setTimeout(10000, () => { req.destroy(new Error('API request timeout')); });
         req.write(payload);
         req.end();
@@ -64,6 +74,7 @@ function apiRequest(body) {
 // ── Получение статистики ───────────────────────────────────────────────────────
 
 async function fetchStats() {
+    log.info('Fetching digest stats from API...');
     const result = await apiRequest({
         domain: 'digest',
         event:  'getDigestStats',
@@ -74,22 +85,31 @@ async function fetchStats() {
         throw new Error('API error: ' + JSON.stringify(result.error));
     }
 
-    return result.data || {listings: null, taxi: null};
+    const data = result.data || {listings: null, taxi: null};
+    const categories = (data.listings || []).filter((i) => Number(i.count) > 0).length;
+    log.info(`Stats fetched: ${categories} categories, taxi=${data.taxi ? `${data.taxi.count} рейсов` : 'нет'}`);
+    return data;
 }
 
 async function fetchAndCacheStats() {
     const stats = await fetchStats();
     saveDigestCache(JSON.stringify(stats));
-    console.log('[digest] Stats cached at', new Date().toISOString());
+    log.info('Stats saved to cache');
     return stats;
 }
 
 function getCachedStats() {
     const row = getDigestCache();
-    if (!row) return null;
+    if (!row) {
+        log.warn('Digest cache is empty — no stats available');
+        return null;
+    }
     try {
+        const age = Math.round((Date.now() / 1000 - row.fetched_at) / 60);
+        log.info(`Using cached stats (age: ${age} min)`);
         return JSON.parse(row.stats_json);
     } catch {
+        log.error('Failed to parse cached stats JSON');
         return null;
     }
 }
@@ -265,12 +285,8 @@ async function sendDigests(bot, webappUrl) {
         return acc;
     }, {});
 
-    console.log(
-        `[digest] Stats: categories=${summary.categories} listings=${summary.listingCount} taxi=${summary.taxiCount} total=${summary.total}`
-    );
-    console.log(
-        `[digest] Subscribers: total=${subscribers.length} by_frequency=${JSON.stringify(byFrequency)}`
-    );
+    log.info(`Send started — subscribers: ${subscribers.length} (${JSON.stringify(byFrequency)})`);
+    log.info(`Stats: ${summary.categories} categories, ${summary.listingCount} listings, ${summary.taxiCount} taxi (total ${summary.total})`);
 
     let sent = 0;
     let skipped = 0;
@@ -305,20 +321,24 @@ async function sendDigests(bot, webappUrl) {
             markSent(sub.telegram_id);
             sent++;
         } catch (err) {
-            console.error(`[digest] Failed to send to ${sub.telegram_id}:`, err.message);
+            log.error(`Failed to send digest to ${sub.telegram_id} (@${sub.username || 'n/a'}): ${err.message}`);
             failed++;
         }
     }
 
-    console.log(`[digest] Done: sent=${sent} skipped=${skipped} failed=${failed}`);
+    log.info(`Send done — sent=${sent} skipped=${skipped} failed=${failed}`);
     if (skipped > 0) {
-        console.log(`[digest] Skipped reasons: ${JSON.stringify(skippedReasons)}`);
+        log.info(`Skipped reasons: ${JSON.stringify(skippedReasons)}`);
+    }
+    if (failed > 0) {
+        log.warn(`${failed} message(s) failed to send`);
     }
 
     return {sent, skipped, failed, skippedReasons};
 }
 
 async function syncSubscribersFromApi() {
+    log.info('Syncing subscribers from API...');
     const result = await apiRequest({
         domain: 'account',
         event:  'getTelegramSubscribers',
@@ -335,17 +355,20 @@ async function syncSubscribersFromApi() {
         });
     }
 
-    console.log(`[digest] Synced ${subscribers.length} subscribers from API`);
+    log.info(`Synced ${subscribers.length} subscribers from API`);
 }
 
 async function runDigest(bot, webappUrl) {
+    log.info('=== runDigest started ===');
     try {
         await syncSubscribersFromApi();
     } catch (err) {
-        console.error('[digest] Failed to sync subscribers, using existing DB:', err.message);
+        log.warn(`Failed to sync subscribers, using existing DB: ${err.message}`);
     }
     await fetchAndCacheStats();
-    return sendDigests(bot, webappUrl);
+    const result = await sendDigests(bot, webappUrl);
+    log.info('=== runDigest completed ===');
+    return result;
 }
 
 module.exports = {
