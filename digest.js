@@ -86,30 +86,49 @@ async function fetchStats() {
     }
 
     const data = result.data || {listings: null, taxi: null};
-    const categories = (data.listings || []).filter((i) => Number(i.count) > 0).length;
-    log.info(`Stats fetched: ${categories} categories, taxi=${data.taxi ? `${data.taxi.count} рейсов` : 'нет'}`);
+    const listings = data.listings || [];
+    const nonZero = listings.filter((i) => Number(i.count) > 0);
+    const total = nonZero.reduce((s, i) => s + Number(i.count), 0);
+    log.info(`Stats fetched: ${listings.length} categories in response, ${nonZero.length} non-empty, total listings=${total}, taxi=${data.taxi ? `count=${data.taxi.count} minPrice=${data.taxi.minPrice}` : 'нет'}`);
+    if (nonZero.length > 0) {
+        const breakdown = nonZero.map((i) => `${i.category}:${i.count}`).join(', ');
+        log.info(`Categories breakdown: ${breakdown}`);
+    } else {
+        log.warn('API returned ZERO non-empty categories — digest will have no content');
+    }
+    if (!data.taxi || Number(data.taxi.count) === 0) {
+        log.warn('API returned no taxi data');
+    }
     return data;
 }
 
 async function fetchAndCacheStats() {
+    const t0 = Date.now();
     const stats = await fetchStats();
     saveDigestCache(JSON.stringify(stats));
-    log.info('Stats saved to cache');
+    log.info(`Stats saved to cache in ${Date.now() - t0}ms`);
     return stats;
 }
+
+const CACHE_STALE_WARN_HOURS = 25;
 
 function getCachedStats() {
     const row = getDigestCache();
     if (!row) {
-        log.warn('Digest cache is empty — no stats available');
+        log.error('Digest cache is EMPTY — fetch cron may have not run or failed. No digest will be sent.');
         return null;
     }
     try {
-        const age = Math.round((Date.now() / 1000 - row.fetched_at) / 60);
-        log.info(`Using cached stats (age: ${age} min)`);
+        const ageMin = Math.round((Date.now() / 1000 - row.fetched_at) / 60);
+        const ageHours = (ageMin / 60).toFixed(1);
+        if (ageMin > CACHE_STALE_WARN_HOURS * 60) {
+            log.warn(`Digest cache is STALE: age=${ageHours}h (>${CACHE_STALE_WARN_HOURS}h) — fetch cron may have failed recently`);
+        } else {
+            log.info(`Using cached stats (age: ${ageHours}h / ${ageMin}min, fetched_at=${new Date(row.fetched_at * 1000).toISOString()})`);
+        }
         return JSON.parse(row.stats_json);
-    } catch {
-        log.error('Failed to parse cached stats JSON');
+    } catch (err) {
+        log.error(`Failed to parse cached stats JSON: ${err.message}`);
         return null;
     }
 }
@@ -165,7 +184,7 @@ function taxiLine(count, minPrice, firstDeparture) {
     return `🚕 <b>Такси во Владикавказ</b> — ${count} рейсов${suffix}`;
 }
 
-function buildDigestText(firstName, stats) {
+function buildDigestText(firstName, stats, {silent = false} = {}) {
     if (!stats) return null;
 
     // Группируем категории с одинаковым названием и фильтруем малозначимые
@@ -205,7 +224,12 @@ function buildDigestText(firstName, stats) {
         lines.push(taxiLine(taxi.count, taxi.minPrice, taxi.firstDeparture));
     }
 
-    if (lines.length === 0) return null;
+    if (lines.length === 0) {
+        if (!silent) {
+            log.warn('buildDigestText: no content — topCategories.length=0, taxi empty. Stats had no usable data.');
+        }
+        return null;
+    }
 
     const name = firstName || 'друг';
     return [`Привет, ${name}! 👋`, '', ...lines].join('\n');
@@ -277,6 +301,11 @@ function buildStatsSummary(stats) {
 
 async function sendDigests(bot, webappUrl) {
     const stats = getCachedStats();
+    if (!stats) {
+        log.error('sendDigests: aborting — cache is empty, nothing to send');
+        return {sent: 0, skipped: 0, failed: 0, skippedReasons: {no_cache: 1}};
+    }
+
     const subscribers = getAllActiveSubscribers();
 
     const summary = buildStatsSummary(stats);
@@ -286,7 +315,13 @@ async function sendDigests(bot, webappUrl) {
     }, {});
 
     log.info(`Send started — subscribers: ${subscribers.length} (${JSON.stringify(byFrequency)})`);
-    log.info(`Stats: ${summary.categories} categories, ${summary.listingCount} listings, ${summary.taxiCount} taxi (total ${summary.total})`);
+    log.info(`Stats summary: categories=${summary.categories} listings=${summary.listingCount} taxi=${summary.taxiCount} total=${summary.total}`);
+
+    // Проверяем: есть ли вообще что слать, ещё до перебора подписчиков
+    const sampleText = buildDigestText('test', stats, {silent: true});
+    if (!sampleText) {
+        log.warn('sendDigests: digest text is empty for ALL subscribers (API returned no usable data) — everyone will be skipped with no_content');
+    }
 
     let sent = 0;
     let skipped = 0;
@@ -298,13 +333,15 @@ async function sendDigests(bot, webappUrl) {
         if (!decision.ok) {
             skipped++;
             incrementCounter(skippedReasons, decision.reason || 'unknown');
+            log.debug(`Skip user=${sub.telegram_id} (@${sub.username || 'n/a'}) reason=${decision.reason} freq=${sub.frequency} last_sent=${sub.last_sent_at ? new Date(sub.last_sent_at * 1000).toISOString() : 'never'}`);
             continue;
         }
 
-        const text = buildDigestText(sub.first_name, stats);
+        const text = buildDigestText(sub.first_name, stats, {silent: true});
         if (!text) {
             skipped++;
             incrementCounter(skippedReasons, 'no_content');
+            log.debug(`Skip user=${sub.telegram_id} (@${sub.username || 'n/a'}) reason=no_content`);
             continue;
         }
 
@@ -320,18 +357,22 @@ async function sendDigests(bot, webappUrl) {
             });
             markSent(sub.telegram_id);
             sent++;
+            log.debug(`Sent digest to user=${sub.telegram_id} (@${sub.username || 'n/a'})`);
         } catch (err) {
-            log.error(`Failed to send digest to ${sub.telegram_id} (@${sub.username || 'n/a'}): ${err.message}`);
+            log.error(`Failed to send digest to user=${sub.telegram_id} (@${sub.username || 'n/a'}): ${err.message}`);
             failed++;
         }
     }
 
     log.info(`Send done — sent=${sent} skipped=${skipped} failed=${failed}`);
     if (skipped > 0) {
-        log.info(`Skipped reasons: ${JSON.stringify(skippedReasons)}`);
+        log.info(`Skipped reasons breakdown: ${JSON.stringify(skippedReasons)}`);
     }
     if (failed > 0) {
         log.warn(`${failed} message(s) failed to send`);
+    }
+    if (sent === 0 && subscribers.length > 0) {
+        log.warn(`sendDigests: sent 0 out of ${subscribers.length} active subscribers — investigate skipped reasons above`);
     }
 
     return {sent, skipped, failed, skippedReasons};
@@ -360,14 +401,15 @@ async function syncSubscribersFromApi() {
 
 async function runDigest(bot, webappUrl) {
     log.info('=== runDigest started ===');
+    const t0 = Date.now();
     try {
         await syncSubscribersFromApi();
     } catch (err) {
-        log.warn(`Failed to sync subscribers, using existing DB: ${err.message}`);
+        log.warn(`Failed to sync subscribers from API (using existing DB): ${err.message}`);
     }
     await fetchAndCacheStats();
     const result = await sendDigests(bot, webappUrl);
-    log.info('=== runDigest completed ===');
+    log.info(`=== runDigest completed in ${Date.now() - t0}ms — sent=${result.sent} skipped=${result.skipped} failed=${result.failed} ===`);
     return result;
 }
 

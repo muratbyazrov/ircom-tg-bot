@@ -4,8 +4,8 @@ const crypto  = require('crypto');
 const express = require('express');
 const {Telegraf, Markup} = require('telegraf');
 
-const {upsertSubscriber, setFrequency, getSubscriber} = require('./db.js');
-const {initScheduler} = require('./scheduler.js');
+const {upsertSubscriber, setFrequency, getSubscriber, getAllActiveSubscribers, getDigestCache} = require('./db.js');
+const {initScheduler, setAdminNotifier} = require('./scheduler.js');
 const {runDigest, buildDigestText, getCachedStats, fetchAndCacheStats} = require('./digest.js');
 const {createLogger} = require('./logger.js');
 
@@ -301,12 +301,37 @@ app.get('/admin/digest/preview/:telegramId', async (req, res) => {
     }
 });
 
-app.get('/health', (_req, res) => res.json({ok: true}));
+app.get('/health', (_req, res) => {
+    try {
+        const cache = getDigestCache();
+        const subscribers = getAllActiveSubscribers();
+        const now = Math.floor(Date.now() / 1000);
+        const cacheInfo = cache
+            ? {
+                fetched_at:  new Date(cache.fetched_at * 1000).toISOString(),
+                age_minutes: Math.round((now - cache.fetched_at) / 60),
+                stale:       (now - cache.fetched_at) > 25 * 3600,
+              }
+            : null;
+        return res.json({
+            ok:          true,
+            uptime_sec:  Math.floor(process.uptime()),
+            subscribers: subscribers.length,
+            digest_cache: cacheInfo,
+        });
+    } catch (err) {
+        return res.status(500).json({ok: false, error: err.message});
+    }
+});
 
 // ── Запуск ─────────────────────────────────────────────────────────────────────
 
 async function start() {
     log.info(`Starting bot... PORT=${PORT} WEBAPP_URL=${WEBAPP_URL}`);
+
+    // Подключаем нотификатор для шедулера
+    setAdminNotifier((lines) => notifyAdmin(lines));
+
     await bot.launch();
     log.info('Bot started polling');
     initScheduler(bot, WEBAPP_URL);
