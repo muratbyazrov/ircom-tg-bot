@@ -1,9 +1,10 @@
 const cron = require('node-cron');
-const {fetchAndCacheStats, sendDigests} = require('./digest.js');
+const {fetchAndCacheStats, sendDigests, syncSubscribersFromApi} = require('./digest.js');
 const {createLogger} = require('./logger.js');
 
 const log = createLogger('scheduler');
 
+const DIGEST_TIMEZONE = process.env.DIGEST_TIMEZONE || 'Europe/Moscow';
 const DIGEST_FETCH_CRON = process.env.DIGEST_FETCH_CRON || '0 9 * * *';   // 09:00 каждый день
 const DIGEST_SEND_CRON  = process.env.DIGEST_SEND_CRON  || '0 10 * * *';  // 10:00 каждый день
 
@@ -43,7 +44,7 @@ function initScheduler(bot, webappUrl) {
                 'Статистика не кэширована — в 10:00 дайджест НЕ отправится',
             ]);
         }
-    }, {timezone: 'Europe/Moscow'});
+    }, {timezone: DIGEST_TIMEZONE});
 
     // 10:00 — рассылаем персональные дайджесты
     cron.schedule(DIGEST_SEND_CRON, async () => {
@@ -51,6 +52,11 @@ function initScheduler(bot, webappUrl) {
         log.info(`Cron SEND triggered at ${now}`);
         const t0 = Date.now();
         try {
+            try {
+                await syncSubscribersFromApi();
+            } catch (err) {
+                log.warn(`Cron SEND: failed to sync subscribers from API, using local DB only: ${err.message}`);
+            }
             const result = await sendDigests(bot, webappUrl);
             const elapsed = Date.now() - t0;
             log.info(`Cron SEND done in ${elapsed}ms — sent=${result.sent} skipped=${result.skipped} failed=${result.failed}`);
@@ -82,9 +88,9 @@ function initScheduler(bot, webappUrl) {
                 `Ошибка: ${err.message}`,
             ]);
         }
-    }, {timezone: 'Europe/Moscow'});
+    }, {timezone: DIGEST_TIMEZONE});
 
-    log.info(`Scheduler initialized — fetch: "${DIGEST_FETCH_CRON}" send: "${DIGEST_SEND_CRON}" tz: Europe/Moscow`);
+    log.info(`Scheduler initialized — fetch: "${DIGEST_FETCH_CRON}" send: "${DIGEST_SEND_CRON}" tz: ${DIGEST_TIMEZONE}`);
 }
 
 module.exports = {initScheduler, setAdminNotifier};

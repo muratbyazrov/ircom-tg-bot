@@ -6,6 +6,7 @@ const {createLogger} = require('./logger.js');
 const log = createLogger('digest');
 
 const API_URL = process.env.API_URL || 'http://127.0.0.1:3002/ircom-api/v1';
+const DIGEST_TIMEZONE = process.env.DIGEST_TIMEZONE || 'Europe/Moscow';
 
 // ── Emoji map по категориям объявлений ─────────────────────────────────────────
 
@@ -148,11 +149,26 @@ function formatTime(iso) {
         return new Intl.DateTimeFormat('ru-RU', {
             hour: '2-digit',
             minute: '2-digit',
-            timeZone: 'Europe/Moscow',
+            timeZone: DIGEST_TIMEZONE,
         }).format(new Date(iso));
     } catch {
         return null;
     }
+}
+
+function getDayKeyInTimeZone(timestamp, timeZone) {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone,
+        year:  'numeric',
+        month: '2-digit',
+        day:   '2-digit',
+    }).formatToParts(new Date(timestamp));
+
+    const year = parts.find((part) => part.type === 'year')?.value;
+    const month = parts.find((part) => part.type === 'month')?.value;
+    const day = parts.find((part) => part.type === 'day')?.value;
+
+    return `${year}-${month}-${day}`;
 }
 
 const MIN_LISTINGS_TO_SHOW = 3;
@@ -252,12 +268,12 @@ function getSendDecision(subscriber, stats) {
 
     const lastSentAt = subscriber.last_sent_at ? subscriber.last_sent_at * 1000 : 0;
     const now = Date.now();
+    const todayKey = getDayKeyInTimeZone(now, DIGEST_TIMEZONE);
+    const lastSentDayKey = lastSentAt ? getDayKeyInTimeZone(lastSentAt, DIGEST_TIMEZONE) : null;
 
     if (freq === 'daily') {
-        // Отправить если ещё не отправляли сегодня
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
-        if (lastSentAt < todayStart.getTime()) return {ok: true};
+        // Отправить если ещё не отправляли сегодня по московскому времени
+        if (lastSentDayKey !== todayKey) return {ok: true};
         return {ok: false, reason: 'daily_already_sent_today'};
     }
 
@@ -267,9 +283,7 @@ function getSendDecision(subscriber, stats) {
     }
 
     if (freq === 'only10plus') {
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
-        if (lastSentAt >= todayStart.getTime()) {
+        if (lastSentDayKey === todayKey) {
             return {ok: false, reason: 'only10plus_already_sent_today'};
         }
         if (totalCount(stats) >= 10) return {ok: true};
@@ -419,5 +433,6 @@ module.exports = {
     buildDigestText,
     sendDigests,
     runDigest,
+    syncSubscribersFromApi,
     totalCount,
 };
