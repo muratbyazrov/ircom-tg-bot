@@ -1,6 +1,6 @@
 const https = require('https');
 const http = require('http');
-const {saveDigestCache, getDigestCache, getAllActiveSubscribers, markSent, upsertSubscriber} = require('./db.js');
+const {getAllActiveSubscribers, markSent, upsertSubscriber} = require('./db.js');
 const {createLogger} = require('./logger.js');
 
 const log = createLogger('digest');
@@ -103,36 +103,6 @@ async function fetchStats() {
     return data;
 }
 
-async function fetchAndCacheStats() {
-    const t0 = Date.now();
-    const stats = await fetchStats();
-    saveDigestCache(JSON.stringify(stats));
-    log.info(`Stats saved to cache in ${Date.now() - t0}ms`);
-    return stats;
-}
-
-const CACHE_STALE_WARN_HOURS = 25;
-
-function getCachedStats() {
-    const row = getDigestCache();
-    if (!row) {
-        log.error('Digest cache is EMPTY — fetch cron may have not run or failed. No digest will be sent.');
-        return null;
-    }
-    try {
-        const ageMin = Math.round((Date.now() / 1000 - row.fetched_at) / 60);
-        const ageHours = (ageMin / 60).toFixed(1);
-        if (ageMin > CACHE_STALE_WARN_HOURS * 60) {
-            log.warn(`Digest cache is STALE: age=${ageHours}h (>${CACHE_STALE_WARN_HOURS}h) — fetch cron may have failed recently`);
-        } else {
-            log.info(`Using cached stats (age: ${ageHours}h / ${ageMin}min, fetched_at=${new Date(row.fetched_at * 1000).toISOString()})`);
-        }
-        return JSON.parse(row.stats_json);
-    } catch (err) {
-        log.error(`Failed to parse cached stats JSON: ${err.message}`);
-        return null;
-    }
-}
 
 // ── Форматирование текста дайджеста ────────────────────────────────────────────
 
@@ -313,13 +283,7 @@ function buildStatsSummary(stats) {
     };
 }
 
-async function sendDigests(bot, webappUrl) {
-    const stats = getCachedStats();
-    if (!stats) {
-        log.error('sendDigests: aborting — cache is empty, nothing to send');
-        return {sent: 0, skipped: 0, failed: 0, skippedReasons: {no_cache: 1}};
-    }
-
+async function sendDigests(bot, webappUrl, stats) {
     const subscribers = getAllActiveSubscribers();
 
     const summary = buildStatsSummary(stats);
@@ -421,15 +385,14 @@ async function runDigest(bot, webappUrl) {
     } catch (err) {
         log.warn(`Failed to sync subscribers from API (using existing DB): ${err.message}`);
     }
-    await fetchAndCacheStats();
-    const result = await sendDigests(bot, webappUrl);
+    const stats = await fetchStats();
+    const result = await sendDigests(bot, webappUrl, stats);
     log.info(`=== runDigest completed in ${Date.now() - t0}ms — sent=${result.sent} skipped=${result.skipped} failed=${result.failed} ===`);
     return result;
 }
 
 module.exports = {
-    fetchAndCacheStats,
-    getCachedStats,
+    fetchStats,
     buildDigestText,
     sendDigests,
     runDigest,

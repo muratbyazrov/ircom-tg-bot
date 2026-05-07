@@ -4,9 +4,9 @@ const crypto  = require('crypto');
 const express = require('express');
 const {Telegraf, Markup} = require('telegraf');
 
-const {upsertSubscriber, setFrequency, getSubscriber, getAllActiveSubscribers, getDigestCache} = require('./db.js');
+const {upsertSubscriber, setFrequency, getSubscriber, getAllActiveSubscribers} = require('./db.js');
 const {initScheduler, setAdminNotifier} = require('./scheduler.js');
-const {runDigest, buildDigestText, getCachedStats, fetchAndCacheStats} = require('./digest.js');
+const {runDigest, buildDigestText, fetchStats} = require('./digest.js');
 const {createLogger} = require('./logger.js');
 
 const log = createLogger('bot');
@@ -186,8 +186,15 @@ bot.command('preview', async (ctx) => {
     const from = ctx.from || {};
     log.info(`/preview — user=${from.id} username=@${from.username || 'n/a'}`);
     try {
+        if (from.id) {
+            upsertSubscriber({
+                telegramId: from.id,
+                firstName:  from.first_name,
+                username:   from.username,
+            });
+        }
         await ctx.reply('⏳ Загружаю статистику...');
-        const stats = await fetchAndCacheStats();
+        const stats = await fetchStats();
         const text = buildDigestText(from.first_name || 'друг', stats);
         if (!text) {
             return ctx.reply('(нет данных для дайджеста — API вернул пустую статистику)');
@@ -292,7 +299,7 @@ app.get('/admin/digest/preview/:telegramId', async (req, res) => {
     }
 
     try {
-        const stats = getCachedStats();
+        const stats = await fetchStats();
         const sub = getSubscriber(Number(req.params.telegramId));
         const text = buildDigestText(sub?.first_name || 'Тест', stats);
         return res.json({ok: true, text: text || '(нет данных для дайджеста)'});
@@ -303,21 +310,11 @@ app.get('/admin/digest/preview/:telegramId', async (req, res) => {
 
 app.get('/health', (_req, res) => {
     try {
-        const cache = getDigestCache();
         const subscribers = getAllActiveSubscribers();
-        const now = Math.floor(Date.now() / 1000);
-        const cacheInfo = cache
-            ? {
-                fetched_at:  new Date(cache.fetched_at * 1000).toISOString(),
-                age_minutes: Math.round((now - cache.fetched_at) / 60),
-                stale:       (now - cache.fetched_at) > 25 * 3600,
-              }
-            : null;
         return res.json({
             ok:          true,
             uptime_sec:  Math.floor(process.uptime()),
             subscribers: subscribers.length,
-            digest_cache: cacheInfo,
         });
     } catch (err) {
         return res.status(500).json({ok: false, error: err.message});

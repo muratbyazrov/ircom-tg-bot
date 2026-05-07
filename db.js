@@ -31,18 +31,10 @@ function getDb() {
             last_sent_at INTEGER,
             created_at   INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
         );
-
-        CREATE TABLE IF NOT EXISTS digest_cache (
-            id          INTEGER PRIMARY KEY CHECK (id = 1),
-            fetched_at  INTEGER NOT NULL,
-            stats_json  TEXT NOT NULL
-        );
     `);
 
     return _db;
 }
-
-// ── Subscribers ────────────────────────────────────────────────────────────────
 
 function upsertSubscriber({telegramId, firstName, username}) {
     log.debug(`upsertSubscriber telegramId=${telegramId} username=@${username || 'n/a'}`);
@@ -82,28 +74,10 @@ function markSent(telegramId) {
     ).run(telegramId);
 }
 
-// ── Digest cache ───────────────────────────────────────────────────────────────
-
-function saveDigestCache(statsJson) {
-    getDb().prepare(`
-        INSERT INTO digest_cache (id, fetched_at, stats_json)
-        VALUES (1, strftime('%s', 'now'), ?)
-        ON CONFLICT (id) DO UPDATE SET
-            fetched_at = excluded.fetched_at,
-            stats_json = excluded.stats_json
-    `).run(statsJson);
-}
-
-function getDigestCache() {
-    return getDb().prepare(`SELECT * FROM digest_cache WHERE id = 1`).get() || null;
-}
-
 module.exports = {
     upsertSubscriber,
     setFrequency,
     getSubscriber,
     getAllActiveSubscribers,
     markSent,
-    saveDigestCache,
-    getDigestCache,
 };
