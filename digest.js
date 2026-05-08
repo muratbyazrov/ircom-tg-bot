@@ -1,6 +1,5 @@
 const https = require('https');
 const http = require('http');
-const {getAllActiveSubscribers, markSent, upsertSubscriber} = require('./db.js');
 const {createLogger} = require('./logger.js');
 
 const log = createLogger('digest');
@@ -236,13 +235,12 @@ function getSendDecision(subscriber, stats) {
     const freq = subscriber.frequency;
     if (freq === 'disabled') return {ok: false, reason: 'disabled'};
 
-    const lastSentAt = subscriber.last_sent_at ? subscriber.last_sent_at * 1000 : 0;
+    const lastSentAt = subscriber.digestSentAt ? new Date(subscriber.digestSentAt).getTime() : 0;
     const now = Date.now();
     const todayKey = getDayKeyInTimeZone(now, DIGEST_TIMEZONE);
     const lastSentDayKey = lastSentAt ? getDayKeyInTimeZone(lastSentAt, DIGEST_TIMEZONE) : null;
 
     if (freq === 'daily') {
-        // Отправить если ещё не отправляли сегодня по московскому времени
         if (lastSentDayKey !== todayKey) return {ok: true};
         return {ok: false, reason: 'daily_already_sent_today'};
     }
@@ -283,19 +281,40 @@ function buildStatsSummary(stats) {
     };
 }
 
-async function sendDigests(bot, webappUrl, stats) {
-    const subscribers = getAllActiveSubscribers();
+async function fetchSubscribers() {
+    log.info('Fetching subscribers from API...');
+    const result = await apiRequest({
+        domain: 'account',
+        event:  'getTelegramSubscribers',
+        params: {},
+    });
+    const subscribers = (result.data || []).filter((s) => s.telegramUserId);
+    log.info(`Fetched ${subscribers.length} subscribers from API`);
+    return subscribers;
+}
 
+async function markSentInApi(telegramUserId) {
+    try {
+        await apiRequest({
+            domain: 'digest',
+            event:  'markDigestSent',
+            params: {telegramUserId: Number(telegramUserId)},
+        });
+    } catch (err) {
+        log.warn(`Failed to mark digest sent in API for user=${telegramUserId}: ${err.message}`);
+    }
+}
+
+async function sendDigests(bot, webappUrl, subscribers, stats) {
     const summary = buildStatsSummary(stats);
     const byFrequency = subscribers.reduce((acc, sub) => {
-        incrementCounter(acc, sub.frequency || 'unknown');
+        incrementCounter(acc, sub.telegramDigestFrequency || 'unknown');
         return acc;
     }, {});
 
     log.info(`Send started — subscribers: ${subscribers.length} (${JSON.stringify(byFrequency)})`);
     log.info(`Stats summary: categories=${summary.categories} listings=${summary.listingCount} taxi=${summary.taxiCount} total=${summary.total}`);
 
-    // Проверяем: есть ли вообще что слать, ещё до перебора подписчиков
     const sampleText = buildDigestText('test', stats, {silent: true});
     if (!sampleText) {
         log.warn('sendDigests: digest text is empty for ALL subscribers (API returned no usable data) — everyone will be skipped with no_content');
@@ -307,24 +326,30 @@ async function sendDigests(bot, webappUrl, stats) {
     const skippedReasons = {};
 
     for (const sub of subscribers) {
-        const decision = getSendDecision(sub, stats);
+        // Приводим поля API к формату ожидаемому getSendDecision
+        const normalized = {
+            frequency:   sub.telegramDigestFrequency || 'daily',
+            digestSentAt: sub.telegramDigestSentAt || null,
+        };
+
+        const decision = getSendDecision(normalized, stats);
         if (!decision.ok) {
             skipped++;
             incrementCounter(skippedReasons, decision.reason || 'unknown');
-            log.debug(`Skip user=${sub.telegram_id} (@${sub.username || 'n/a'}) reason=${decision.reason} freq=${sub.frequency} last_sent=${sub.last_sent_at ? new Date(sub.last_sent_at * 1000).toISOString() : 'never'}`);
+            log.debug(`Skip user=${sub.telegramUserId} reason=${decision.reason} freq=${normalized.frequency} last_sent=${normalized.digestSentAt || 'never'}`);
             continue;
         }
 
-        const text = buildDigestText(sub.first_name, stats, {silent: true});
+        const text = buildDigestText(sub.name, stats, {silent: true});
         if (!text) {
             skipped++;
             incrementCounter(skippedReasons, 'no_content');
-            log.debug(`Skip user=${sub.telegram_id} (@${sub.username || 'n/a'}) reason=no_content`);
+            log.debug(`Skip user=${sub.telegramUserId} reason=no_content`);
             continue;
         }
 
         try {
-            await bot.telegram.sendMessage(sub.telegram_id, text, {
+            await bot.telegram.sendMessage(sub.telegramUserId, text, {
                 parse_mode: 'HTML',
                 reply_markup: {
                     inline_keyboard: [
@@ -333,22 +358,18 @@ async function sendDigests(bot, webappUrl, stats) {
                     ],
                 },
             });
-            markSent(sub.telegram_id);
+            markSentInApi(sub.telegramUserId);
             sent++;
-            log.debug(`Sent digest to user=${sub.telegram_id} (@${sub.username || 'n/a'})`);
+            log.debug(`Sent digest to user=${sub.telegramUserId}`);
         } catch (err) {
-            log.error(`Failed to send digest to user=${sub.telegram_id} (@${sub.username || 'n/a'}): ${err.message}`);
+            log.error(`Failed to send digest to user=${sub.telegramUserId}: ${err.message}`);
             failed++;
         }
     }
 
     log.info(`Send done — sent=${sent} skipped=${skipped} failed=${failed}`);
-    if (skipped > 0) {
-        log.info(`Skipped reasons breakdown: ${JSON.stringify(skippedReasons)}`);
-    }
-    if (failed > 0) {
-        log.warn(`${failed} message(s) failed to send`);
-    }
+    if (skipped > 0) log.info(`Skipped reasons breakdown: ${JSON.stringify(skippedReasons)}`);
+    if (failed > 0) log.warn(`${failed} message(s) failed to send`);
     if (sent === 0 && subscribers.length > 0) {
         log.warn(`sendDigests: sent 0 out of ${subscribers.length} active subscribers — investigate skipped reasons above`);
     }
@@ -356,39 +377,38 @@ async function sendDigests(bot, webappUrl, stats) {
     return {sent, skipped, failed, skippedReasons};
 }
 
-async function syncSubscribersFromApi() {
-    log.info('Syncing subscribers from API...');
-    const result = await apiRequest({
-        domain: 'account',
-        event:  'getTelegramSubscribers',
-        params: {},
-    });
-
-    const subscribers = result.data || [];
-    for (const sub of subscribers) {
-        if (!sub.telegramUserId) continue;
-        upsertSubscriber({
-            telegramId: sub.telegramUserId,
-            firstName:  sub.name || null,
-            username:   null,
-        });
-    }
-
-    log.info(`Synced ${subscribers.length} subscribers from API`);
-}
-
 async function runDigest(bot, webappUrl) {
     log.info('=== runDigest started ===');
     const t0 = Date.now();
-    try {
-        await syncSubscribersFromApi();
-    } catch (err) {
-        log.warn(`Failed to sync subscribers from API (using existing DB): ${err.message}`);
-    }
-    const stats = await fetchStats();
-    const result = await sendDigests(bot, webappUrl, stats);
+    const [subscribers, stats] = await Promise.all([
+        fetchSubscribers(),
+        fetchStats(),
+    ]);
+    const result = await sendDigests(bot, webappUrl, subscribers, stats);
     log.info(`=== runDigest completed in ${Date.now() - t0}ms — sent=${result.sent} skipped=${result.skipped} failed=${result.failed} ===`);
     return result;
+}
+
+async function getDigestSettings(telegramUserId) {
+    try {
+        const result = await apiRequest({
+            domain: 'digest',
+            event:  'getDigestSettings',
+            params: {telegramUserId: Number(telegramUserId)},
+        });
+        return result.data || null;
+    } catch (err) {
+        log.warn(`Failed to get digest settings for user=${telegramUserId}: ${err.message}`);
+        return null;
+    }
+}
+
+async function setDigestFrequency(telegramUserId, frequency) {
+    await apiRequest({
+        domain: 'digest',
+        event:  'setDigestFrequency',
+        params: {telegramUserId: Number(telegramUserId), frequency},
+    });
 }
 
 module.exports = {
@@ -396,6 +416,9 @@ module.exports = {
     buildDigestText,
     sendDigests,
     runDigest,
-    syncSubscribersFromApi,
+    fetchSubscribers,
+    markSentInApi,
+    getDigestSettings,
+    setDigestFrequency,
     totalCount,
 };

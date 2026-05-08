@@ -4,9 +4,8 @@ const crypto  = require('crypto');
 const express = require('express');
 const {Telegraf, Markup} = require('telegraf');
 
-const {upsertSubscriber, setFrequency, getSubscriber, getAllActiveSubscribers} = require('./db.js');
 const {initScheduler, setAdminNotifier} = require('./scheduler.js');
-const {runDigest, buildDigestText, fetchStats} = require('./digest.js');
+const {runDigest, buildDigestText, fetchStats, getDigestSettings, setDigestFrequency} = require('./digest.js');
 const {createLogger} = require('./logger.js');
 
 const log = createLogger('bot');
@@ -78,8 +77,7 @@ function buildSettingsKeyboard(currentFreq) {
     ]);
 }
 
-function settingsText(sub) {
-    const freq = sub ? sub.frequency : 'daily';
+function settingsText(freq) {
     return [
         '⚙️ <b>Настройки уведомлений</b>',
         '',
@@ -88,6 +86,7 @@ function settingsText(sub) {
         `Текущая настройка: <b>${FREQUENCY_LABELS[freq] || freq}</b>`,
     ].join('\n');
 }
+
 
 // ── Уведомление администратора ────────────────────────────────────────────────
 
@@ -104,13 +103,6 @@ async function notifyAdmin(lines) {
 bot.start(async (ctx) => {
     const from = ctx.from || {};
     log.info(`/start — user=${from.id} username=@${from.username || 'n/a'} name=${from.first_name || 'n/a'}`);
-
-    // Регистрируем пользователя в базе подписчиков
-    upsertSubscriber({
-        telegramId: from.id,
-        firstName:  from.first_name,
-        username:   from.username,
-    });
 
     await notifyAdmin([
         '▶️ /start в боте',
@@ -134,10 +126,11 @@ bot.start(async (ctx) => {
 // Открытие настроек уведомлений
 bot.action('digest_settings', async (ctx) => {
     await ctx.answerCbQuery();
-    const sub = getSubscriber(ctx.from.id);
-    await ctx.reply(settingsText(sub), {
+    const settings = await getDigestSettings(ctx.from.id);
+    const freq = settings?.frequency || 'daily';
+    await ctx.reply(settingsText(freq), {
         parse_mode: 'HTML',
-        ...buildSettingsKeyboard(sub?.frequency || 'daily'),
+        ...buildSettingsKeyboard(freq),
     });
 });
 
@@ -158,20 +151,11 @@ bot.action(/^freq:(.+)$/, async (ctx) => {
 
     log.info(`Frequency set — user=${ctx.from.id} freq=${freq}`);
 
-    // Убеждаемся, что пользователь есть в базе
-    upsertSubscriber({
-        telegramId: ctx.from.id,
-        firstName:  ctx.from.first_name,
-        username:   ctx.from.username,
-    });
-
-    setFrequency(ctx.from.id, freq);
+    await setDigestFrequency(ctx.from.id, freq);
     await ctx.answerCbQuery('Сохранено ✅');
 
-    // Обновляем сообщение с настройками
-    const sub = getSubscriber(ctx.from.id);
     try {
-        await ctx.editMessageText(settingsText(sub), {
+        await ctx.editMessageText(settingsText(freq), {
             parse_mode: 'HTML',
             ...buildSettingsKeyboard(freq),
         });
@@ -186,13 +170,6 @@ bot.command('preview', async (ctx) => {
     const from = ctx.from || {};
     log.info(`/preview — user=${from.id} username=@${from.username || 'n/a'}`);
     try {
-        if (from.id) {
-            upsertSubscriber({
-                telegramId: from.id,
-                firstName:  from.first_name,
-                username:   from.username,
-            });
-        }
         await ctx.reply('⏳ Загружаю статистику...');
         const stats = await fetchStats();
         const text = buildDigestText(from.first_name || 'друг', stats);
@@ -246,12 +223,6 @@ app.post('/webapp/open', async (req, res) => {
 
         if (user?.id) {
             log.info(`POST /webapp/open — user=${user.id} username=@${user.username || 'n/a'}`);
-            // Регистрируем пользователя при первом открытии Mini App
-            upsertSubscriber({
-                telegramId: user.id,
-                firstName:  user.first_name,
-                username:   user.username,
-            });
         }
 
         await notifyAdmin([
@@ -300,8 +271,7 @@ app.get('/admin/digest/preview/:telegramId', async (req, res) => {
 
     try {
         const stats = await fetchStats();
-        const sub = getSubscriber(Number(req.params.telegramId));
-        const text = buildDigestText(sub?.first_name || 'Тест', stats);
+        const text = buildDigestText('Тест', stats);
         return res.json({ok: true, text: text || '(нет данных для дайджеста)'});
     } catch (err) {
         return res.status(500).json({ok: false, error: err.message});
@@ -309,40 +279,32 @@ app.get('/admin/digest/preview/:telegramId', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => {
-    try {
-        const subscribers = getAllActiveSubscribers();
-        return res.json({
-            ok:          true,
-            uptime_sec:  Math.floor(process.uptime()),
-            subscribers: subscribers.length,
-        });
-    } catch (err) {
-        return res.status(500).json({ok: false, error: err.message});
-    }
+    return res.json({
+        ok:         true,
+        uptime_sec: Math.floor(process.uptime()),
+    });
 });
 
 // ── Запуск ─────────────────────────────────────────────────────────────────────
-
-async function start() {
-    log.info(`Starting bot... PORT=${PORT} WEBAPP_URL=${WEBAPP_URL}`);
-
-    // Подключаем нотификатор для шедулера
-    setAdminNotifier((lines) => notifyAdmin(lines));
-
-    await bot.launch();
-    log.info('Bot started polling');
-    initScheduler(bot, WEBAPP_URL);
-    app.listen(PORT, () => log.info(`HTTP server listening on port ${PORT}`));
-}
 
 bot.catch((err) => log.error('Telegraf error', err));
 
 const RETRY_DELAYS_MS = [5000, 10000, 20000, 30000, 60000];
 
 (async () => {
+    // Подключаем нотификатор для шедулера
+    setAdminNotifier((lines) => notifyAdmin(lines));
+
+    // HTTP-сервер и шедулер запускаем сразу — они не зависят от polling.
+    // sendMessage работает через REST API независимо от getUpdates.
+    app.listen(PORT, () => log.info(`HTTP server listening on port ${PORT}`));
+    initScheduler(bot, WEBAPP_URL);
+
     for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
         try {
-            await start();
+            log.info(`Starting bot... PORT=${PORT} WEBAPP_URL=${WEBAPP_URL}`);
+            await bot.launch(); // блокирует до остановки бота
+            log.info('Bot stopped');
             return;
         } catch (err) {
             const is409 = err.message && err.message.includes('409');

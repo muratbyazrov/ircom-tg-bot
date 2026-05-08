@@ -36,15 +36,18 @@ function getDb() {
     return _db;
 }
 
-function upsertSubscriber({telegramId, firstName, username}) {
+function upsertSubscriber({telegramId, firstName, username, digestSentAt}) {
     log.debug(`upsertSubscriber telegramId=${telegramId} username=@${username || 'n/a'}`);
+    // digestSentAt приходит из postgres как ISO-строка, переводим в unix timestamp
+    const lastSentAt = digestSentAt ? Math.floor(new Date(digestSentAt).getTime() / 1000) : null;
     getDb().prepare(`
-        INSERT INTO subscribers (telegram_id, first_name, username)
-        VALUES (@telegramId, @firstName, @username)
+        INSERT INTO subscribers (telegram_id, first_name, username, last_sent_at)
+        VALUES (@telegramId, @firstName, @username, @lastSentAt)
         ON CONFLICT (telegram_id) DO UPDATE SET
-            first_name = excluded.first_name,
-            username   = excluded.username
-    `).run({telegramId, firstName: firstName || null, username: username || null});
+            first_name   = excluded.first_name,
+            username     = excluded.username,
+            last_sent_at = excluded.last_sent_at
+    `).run({telegramId, firstName: firstName || null, username: username || null, lastSentAt});
 }
 
 function setFrequency(telegramId, frequency) {
