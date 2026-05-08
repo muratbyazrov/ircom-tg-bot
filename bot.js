@@ -337,10 +337,26 @@ async function start() {
 
 bot.catch((err) => log.error('Telegraf error', err));
 
-start().catch((err) => {
-    log.error('Failed to start bot', err);
-    process.exit(1);
-});
+const RETRY_DELAYS_MS = [5000, 10000, 20000, 30000, 60000];
+
+(async () => {
+    for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+        try {
+            await start();
+            return;
+        } catch (err) {
+            const is409 = err.message && err.message.includes('409');
+            if (is409 && attempt < RETRY_DELAYS_MS.length) {
+                const delay = RETRY_DELAYS_MS[attempt];
+                log.warn(`Got 409 conflict (attempt ${attempt + 1}/${RETRY_DELAYS_MS.length + 1}), retrying in ${delay / 1000}s...`);
+                await new Promise((r) => setTimeout(r, delay));
+            } else {
+                log.error('Failed to start bot', err);
+                process.exit(1);
+            }
+        }
+    }
+})();
 
 process.once('SIGINT',  () => { log.info('Received SIGINT, stopping...'); bot.stop('SIGINT'); });
 process.once('SIGTERM', () => { log.info('Received SIGTERM, stopping...'); bot.stop('SIGTERM'); });
